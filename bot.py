@@ -1,164 +1,200 @@
 import os
 import asyncio
+from collections import defaultdict
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import Message, InputMediaPhoto, InputMediaVideo
 from aiogram.filters import Command
+from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
-from storage import get_or_create_alias, get_user_by_alias
+from storage import get_or_create_alias
 
-# Загрузка токена и ID чата админов
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID"))
+OWNER_ID = int(os.getenv("OWNER_ID"))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# FSM-состояния для ручного ответа
-class ReplyState(StatesGroup):
-    waiting_for_text = State()
+message_map = {}
 
-# Временное хранилище — кто кому отвечает
-admin_reply_targets = {}
+# Хранилища альбомов
+user_media_groups = defaultdict(list)
+admin_media_groups = defaultdict(list)
+media_group_timers = {}
 
-# Быстрые шаблоны
-quick_replies = [
-    "Пожалуйста, уточните ваш вопрос 😊",
-    "Мы проверим и вернёмся с ответом 🔍",
-    "Ваше обращение принято в обработку ✅"
-]
-
-# Клавиатура под каждым сообщением от пользователя (без кнопки Удалить)
-def get_reply_keyboard(alias):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✍️ Ответить", callback_data=f"reply_to:{alias}"),
-                InlineKeyboardButton(text="🔁 Быстрый ответ", callback_data=f"quick_reply:{alias}")
-            ]
-        ]
-    )
-
-# ✅ Приветствие по /start
+# /start
 @dp.message(Command("start"))
-async def handle_start(message: types.Message):
+async def handle_start(message: Message):
     alias = get_or_create_alias(message.from_user.id)
     text = (
         f"👋 Привет, {alias}!\n\n"
-        "Ты написал(-а) в поддержку.\n"
-        "Просто напиши свой вопрос или сообщение сюда, и наши админы скоро ответят тебе 💬"
+        "Ты написала(-а) в поддержку. Просто напиши свой вопрос — и наши админы скоро ответят 💬"
     )
     await message.answer(text)
 
-# ✅ Сообщения от пользователя → в чат админов
-@dp.message(F.chat.id != ADMIN_CHAT_ID)
-async def handle_user_message(message: types.Message):
+# 📥 Обработка сообщений от пользователя
+@dp.message(F.chat.type == "private")
+async def handle_user_message(message: Message):
     user_id = message.from_user.id
+    username = message.from_user.username
     alias = get_or_create_alias(user_id)
-    header = f"**{alias}**\n"
-    sent = False
+    caption = message.caption or ""
 
-    # Текст
+    id_or_username = f"@{username}" if username else f"ID: {user_id}"
+    header = f"**{alias}**\n{caption}"
+    header_with_id = f"**{alias} ({id_or_username})**\n{caption}"
+
+    if message.media_group_id:
+        user_media_groups[message.media_group_id].append((message, alias, username))
+        if message.media_group_id not in media_group_timers:
+            media_group_timers[message.media_group_id] = asyncio.create_task(
+                process_user_album(message.media_group_id)
+            )
+        return
+
+    await forward_single_message(message, alias, header, header_with_id, user_id, username)
+
+# 🔄 Отправка одиночного медиа/текста от пользователя
+async def forward_single_message(message, alias, header, header_with_id, user_id, username):
+    forwarded = None
+    forwarded_owner = None
+
     if message.text:
-        await bot.send_message(ADMIN_CHAT_ID, header + message.text, parse_mode="Markdown", reply_markup=get_reply_keyboard(alias))
-        sent = True
-    # Медиа
+        forwarded = await bot.send_message(ADMIN_CHAT_ID, f"**{alias}**\n{message.text}", parse_mode="Markdown")
+        forwarded_owner = await bot.send_message(OWNER_ID, f"{header_with_id}", parse_mode="Markdown")
+
     elif message.photo:
-        await bot.send_photo(ADMIN_CHAT_ID, message.photo[-1].file_id, caption=header, parse_mode="Markdown", reply_markup=get_reply_keyboard(alias))
-        sent = True
+        forwarded = await bot.send_photo(ADMIN_CHAT_ID, message.photo[-1].file_id, caption=header, parse_mode="Markdown")
+        forwarded_owner = await bot.send_photo(OWNER_ID, message.photo[-1].file_id, caption=header_with_id, parse_mode="Markdown")
+
     elif message.document:
-        await bot.send_document(ADMIN_CHAT_ID, message.document.file_id, caption=header, parse_mode="Markdown", reply_markup=get_reply_keyboard(alias))
-        sent = True
-    elif message.video:
-        await bot.send_video(ADMIN_CHAT_ID, message.video.file_id, caption=header, parse_mode="Markdown", reply_markup=get_reply_keyboard(alias))
-        sent = True
+        forwarded = await bot.send_document(ADMIN_CHAT_ID, message.document.file_id, caption=header, parse_mode="Markdown")
+        forwarded_owner = await bot.send_document(OWNER_ID, message.document.file_id, caption=header_with_id, parse_mode="Markdown")
+
     elif message.voice:
-        await bot.send_voice(ADMIN_CHAT_ID, message.voice.file_id, caption=header, parse_mode="Markdown", reply_markup=get_reply_keyboard(alias))
-        sent = True
+        forwarded = await bot.send_voice(ADMIN_CHAT_ID, message.voice.file_id, caption=header, parse_mode="Markdown")
+        forwarded_owner = await bot.send_voice(OWNER_ID, message.voice.file_id, caption=header_with_id, parse_mode="Markdown")
 
-    if not sent:
-        await bot.send_message(ADMIN_CHAT_ID, header + "📎 Неизвестный формат.", parse_mode="Markdown", reply_markup=get_reply_keyboard(alias))
+    elif message.video:
+        forwarded = await bot.send_video(ADMIN_CHAT_ID, message.video.file_id, caption=header, parse_mode="Markdown")
+        forwarded_owner = await bot.send_video(OWNER_ID, message.video.file_id, caption=header_with_id, parse_mode="Markdown")
 
-# ✍️ Ответить вручную
-@dp.callback_query(F.data.startswith("reply_to:"))
-async def handle_reply_button(callback: CallbackQuery, state: FSMContext):
-    alias = callback.data.split(":", 1)[1]
-    user_id = get_user_by_alias(alias)
+    elif message.sticker:
+        forwarded = await bot.send_sticker(ADMIN_CHAT_ID, message.sticker.file_id)
+        forwarded_owner = await bot.send_sticker(OWNER_ID, message.sticker.file_id)
 
-    if not user_id:
-        await callback.message.answer("❌ Пользователь не найден.")
-        await callback.answer()
+    if forwarded:
+        message_map[forwarded.message_id] = user_id
+    if forwarded_owner:
+        message_map[forwarded_owner.message_id] = user_id
+
+# 🔄 Обработка альбома от пользователя
+async def process_user_album(media_group_id):
+    await asyncio.sleep(1.5)
+    group = user_media_groups.pop(media_group_id, [])
+    if not group:
         return
 
-    admin_reply_targets[callback.from_user.id] = user_id
-    await state.set_state(ReplyState.waiting_for_text)
-    await callback.message.answer(f"✍️ Напиши, что отправить пользователю с псевдонимом **{alias}**", parse_mode="Markdown")
-    await callback.answer()
+    user_id = group[0][0].from_user.id
+    alias = group[0][1]
+    username = group[0][2]
+    id_or_username = f"@{username}" if username else f"ID: {user_id}"
 
-@dp.message(ReplyState.waiting_for_text)
-async def process_admin_reply(message: types.Message, state: FSMContext):
-    admin_id = message.from_user.id
-    user_id = admin_reply_targets.get(admin_id)
+    media_admin = []
+    media_owner = []
 
+    for i, (msg, _, _) in enumerate(group):
+        cap = msg.caption or ""
+        cap_with_alias = f"**{alias}**\n{cap}" if i == 0 else None
+        cap_with_id = f"**{alias} ({id_or_username})**\n{cap}" if i == 0 else None
+
+        if msg.photo:
+            media_admin.append(InputMediaPhoto(media=msg.photo[-1].file_id, caption=cap_with_alias, parse_mode="Markdown"))
+            media_owner.append(InputMediaPhoto(media=msg.photo[-1].file_id, caption=cap_with_id, parse_mode="Markdown"))
+        elif msg.video:
+            media_admin.append(InputMediaVideo(media=msg.video.file_id, caption=cap_with_alias, parse_mode="Markdown"))
+            media_owner.append(InputMediaVideo(media=msg.video.file_id, caption=cap_with_id, parse_mode="Markdown"))
+
+    if media_admin:
+        sent = await bot.send_media_group(ADMIN_CHAT_ID, media_admin)
+        sent_owner = await bot.send_media_group(OWNER_ID, media_owner)
+        for s in sent + sent_owner:
+            message_map[s.message_id] = user_id
+
+# 📤 Ответ от админа — с поддержкой альбома
+@dp.message(F.chat.id.in_({ADMIN_CHAT_ID, OWNER_ID}))
+async def handle_admin_reply(message: Message):
+    if not message.reply_to_message:
+        return
+
+    media_group_id = message.media_group_id
+    if media_group_id:
+        admin_media_groups[media_group_id].append(message)
+        if media_group_id not in media_group_timers:
+            media_group_timers[media_group_id] = asyncio.create_task(
+                process_admin_album(media_group_id, message.reply_to_message.message_id)
+            )
+        return
+
+    await process_admin_reply(message, message.reply_to_message.message_id)
+
+# ⏳ Обработка альбома от админа
+async def process_admin_album(media_group_id, original_message_id):
+    await asyncio.sleep(1.5)
+    group = admin_media_groups.pop(media_group_id, [])
+    user_id = message_map.get(original_message_id)
     if not user_id:
-        await message.reply("⚠️ Ошибка: не удалось найти пользователя.")
-        await state.clear()
+        return
+
+    media = []
+    for i, msg in enumerate(group):
+        cap = msg.caption or ""
+        if msg.photo:
+            media.append(InputMediaPhoto(media=msg.photo[-1].file_id, caption=f"💬 Поддержка:\n{cap}" if i == 0 else None))
+        elif msg.video:
+            media.append(InputMediaVideo(media=msg.video.file_id, caption=f"💬 Поддержка:\n{cap}" if i == 0 else None))
+
+    if media:
+        await bot.send_media_group(user_id, media)
+        conf = await group[-1].reply("✅ Отправлено пользователю.")
+        await asyncio.sleep(3)
+        await conf.delete()
+
+# 🔁 Обычный ответ от админа
+async def process_admin_reply(message: Message, original_id: int):
+    user_id = message_map.get(original_id)
+    if not user_id:
+        await message.reply("⚠️ Не удалось определить, кому ответить.")
         return
 
     try:
-        await bot.send_message(user_id, f"💬 Ответ поддержки:\n{message.text}")
-        await message.reply("✅ Сообщение отправлено.")
-    except Exception:
-        await message.reply("⚠️ Не удалось отправить сообщение.")
+        text = message.text or message.caption or ""
 
-    await state.clear()
-    del admin_reply_targets[admin_id]
+        if message.text:
+            await bot.send_message(user_id, f"💬 Поддержка:\n{text}")
+        elif message.photo:
+            await bot.send_photo(user_id, message.photo[-1].file_id, caption=f"💬 Поддержка:\n{text}")
+        elif message.document:
+            await bot.send_document(user_id, message.document.file_id, caption=f"💬 Поддержка:\n{text}")
+        elif message.voice:
+            await bot.send_voice(user_id, message.voice.file_id, caption="💬 Поддержка")
+        elif message.video:
+            await bot.send_video(user_id, message.video.file_id, caption=f"💬 Поддержка:\n{text}")
+        elif message.sticker:
+            await bot.send_sticker(user_id, message.sticker.file_id)
+        else:
+            await message.reply("⚠️ Тип контента пока не поддерживается.")
 
-# 🔁 Быстрый ответ
-@dp.callback_query(F.data.startswith("quick_reply:"))
-async def handle_quick_reply(callback: CallbackQuery):
-    alias = callback.data.split(":", 1)[1]
-    user_id = get_user_by_alias(alias)
+        confirmation = await message.reply("✅ Отправлено пользователю.")
+        await asyncio.sleep(3)
+        await confirmation.delete()
+    except Exception as e:
+        await message.reply(f"⚠️ Ошибка при отправке: {e}")
 
-    if not user_id:
-        await callback.message.answer("❌ Пользователь не найден.")
-        await callback.answer()
-        return
-
-    buttons = [
-        [InlineKeyboardButton(text=msg[:40], callback_data=f"send_quick:{user_id}:{i}")]
-        for i, msg in enumerate(quick_replies)
-    ]
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.answer("📌 Выбери шаблон для быстрого ответа:", reply_markup=keyboard)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("send_quick:"))
-async def send_quick_reply(callback: CallbackQuery):
-    parts = callback.data.split(":")
-    user_id = int(parts[1])
-    index = int(parts[2])
-
-    if index >= len(quick_replies):
-        await callback.answer("⚠️ Шаблон не найден.")
-        return
-
-    try:
-        await bot.send_message(user_id, f"💬 Ответ поддержки:\n{quick_replies[index]}")
-        await callback.message.answer("✅ Быстрый ответ отправлен.")
-    except Exception:
-        await callback.message.answer("⚠️ Ошибка при отправке.")
-    await callback.answer()
-
-# Старт
-async def on_startup(dp: Dispatcher):
-    await bot.send_message(ADMIN_CHAT_ID, "🤖 Бот поддержки запущен!")
-
+# ▶️ Запуск
 async def main():
-    await on_startup(dp)
+    await bot.send_message(ADMIN_CHAT_ID, "🤖 Supplier Bot запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
